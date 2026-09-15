@@ -1,0 +1,37 @@
+name: PR Title Check
+# Referenced by a Dutch-IoT-Solutions org ruleset (WORKFLOWS rule type, i.e.
+# GitHub's "required workflow" mechanism), scoped to every repo in the org.
+# This is NOT a workflow_call reusable workflow: required-workflow rulesets
+# reference a self-triggering workflow by repository_id+path+ref and run it
+# directly against the target repo's PR, so it needs its own on: pull_request
+# trigger and does not need checking out a second repo.
+#
+# Convention: "<PROJECT>-<ticket> - <description>" or "<PROJECT>-<ticket>: <description>"
+# where <PROJECT> is any valid Jira project key (2-10 uppercase letters,
+# e.g. BTEF) - deliberately not hardcoded to one key, since more than one
+# project may end up filing work against these repos. Dependabot's own PR
+# titles are exempt: it can't be told to prefix a ticket number, and its
+# branch/PR flow is already scoped out of the companion branch-naming
+# ruleset.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  title-format:
+    name: Title matches the <PROJECT>-<ticket> convention
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.user.login != 'dependabot[bot]'
+    steps:
+      - name: Validate PR title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          pattern='^[A-Z]{2,10}-[0-9]+[[:space:]]*[-:][[:space:]]*.+'
+          if ! printf '%s' "$TITLE" | grep -Eq "$pattern"; then
+            echo "::error::PR title '$TITLE' does not match the required '<PROJECT>-<ticket> - <description>' format (e.g. BTEF-1234)."
+            echo "Example: BTEF-1234 - Add device deployment retry"
+            exit 1
+          fi
+          echo "PR title OK: $TITLE"
