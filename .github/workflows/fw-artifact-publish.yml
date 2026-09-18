@@ -29,11 +29,14 @@ on:
         description: Name of the actions-artifact (uploaded earlier in this run) holding the built files
         required: true
         type: string
-      files:
+      files_json:
         description: >-
-          Newline-separated list of file paths, relative to the downloaded artifact root, to
-          upload. Each is uploaded under its own basename - the artifact's directory structure is
-          not preserved in the S3 key.
+          JSON array of file paths (e.g. '["a/b.hex", "a/c.bin"]'), relative to the downloaded
+          artifact root, to upload. Each is uploaded under its own basename - the artifact's
+          directory structure is not preserved in the S3 key. A JSON array, not a
+          newline-separated string: that made the caller's YAML scalar style (block `|` vs.
+          folded `>-`) part of this workflow's API by accident, and any malformed input parses
+          as "zero files" instead of failing loudly.
         required: true
         type: string
       version:
@@ -94,15 +97,21 @@ jobs:
         env:
           BUCKET: ${{ vars.AWS_FW_RC_BUCKET }}
           PREFIX: ${{ steps.dest.outputs.prefix }}
-          FILES: ${{ inputs.files }}
+          FILES_JSON: ${{ inputs.files_json }}
         run: |
           set -euo pipefail
           if [ -z "$BUCKET" ]; then
             echo "vars.AWS_FW_RC_BUCKET is not set on the calling repo - nothing to upload to." >&2
             exit 1
           fi
+          if ! printf '%s' "$FILES_JSON" | jq -e 'type == "array" and length > 0 and all(.[]; type == "string")' >/dev/null 2>&1; then
+            echo "files_json must be a non-empty JSON array of strings, got: ${FILES_JSON}" >&2
+            exit 1
+          fi
+          mapfile -t PATTERNS <<< "$(printf '%s' "$FILES_JSON" | jq -r '.[]')"
           UPLOADED=0
-          while IFS= read -r pattern; do
+          for pattern in "${PATTERNS[@]}"; do
+            pattern="${pattern%$'\r'}" # tolerate a stray CR (CRLF input) rather than a silent non-match
             [ -z "$pattern" ] && continue
             for f in fw-artifact/$pattern; do
               [ -e "$f" ] || continue
@@ -111,9 +120,9 @@ jobs:
               aws s3 cp "$f" "$dest"
               UPLOADED=$((UPLOADED + 1))
             done
-          done <<< "$FILES"
+          done
           if [ "$UPLOADED" -eq 0 ]; then
-            echo "No files matched the 'files' input under the downloaded artifact - failing closed." >&2
+            echo "No files matched any pattern in files_json under the downloaded artifact - failing closed." >&2
             exit 1
           fi
           echo "Published ${UPLOADED} file(s) to s3://${BUCKET}/${PREFIX}" >> "$GITHUB_STEP_SUMMARY"
