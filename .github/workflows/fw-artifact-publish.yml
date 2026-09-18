@@ -1,0 +1,128 @@
+name: Reusable firmware artifact publish (S3)
+# =============================================================================
+# INF-82: uploads a firmware build's files to the shared dis-firmware-release-candidates S3
+# bucket (shared-platform account - one bucket for every environment and every device repo; the
+# binaries are environment-agnostic, only their promotion state differs, see the companion
+# clc-infra-tg PR), so devices can later download a specific candidate for testing, or have it
+# promoted to a release, via clc-device-configurator's presigned URLs. Additive: runs alongside
+# this repo's existing GitHub-Release publish path - see fw-release.yml and fw-cleanup-pr.yml for
+# the rest of the flow.
+#
+# Called from a caller job that already built the firmware and uploaded it as a
+# `actions/upload-artifact` artifact earlier in the SAME workflow run - this job downloads that
+# artifact by name (same-run artifact download needs no extra token/permissions) rather than
+# rebuilding.
+#
+# Key layout (shared by every repo that adopts this workflow, so the bucket's one lifecycle rule
+# and the fw-release contract both keep working without further Terraform changes):
+#   pull_request event -> pr/<repo>/<pr_number>/<short_sha>/<filename>
+#   push / workflow_dispatch event -> main/<repo>/<version>/<filename>
+#
+# Mark the calling job `continue-on-error: true` while this is running alongside the existing
+# publish path (see dis-ohm-nrf's pr-pipeline.yml) - a failure here must never block a PR or a
+# merge to main. Flip that once this has been validated.
+# =============================================================================
+on:
+  workflow_call:
+    inputs:
+      artifact_name:
+        description: Name of the actions-artifact (uploaded earlier in this run) holding the built files
+        required: true
+        type: string
+      files_json:
+        description: >-
+          JSON array of file paths (e.g. '["a/b.hex", "a/c.bin"]'), relative to the downloaded
+          artifact root, to upload. Each is uploaded under its own basename - the artifact's
+          directory structure is not preserved in the S3 key. A JSON array, not a
+          newline-separated string: that made the caller's YAML scalar style (block `|` vs.
+          folded `>-`) part of this workflow's API by accident, and any malformed input parses
+          as "zero files" instead of failing loudly.
+        required: true
+        type: string
+      version:
+        description: >-
+          Version string to key a main-branch build under (e.g. the app's own fw version). Falls
+          back to the short commit SHA when empty - always set this once the repo has a real
+          version identifier, so a release-candidate has a stable, human-meaningful key (it also
+          becomes the release key, unchanged, if this candidate is later promoted).
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: Publish firmware artifact to S3 (release-candidates)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Determine destination key prefix
+        id: dest
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            SHORT_SHA="${PR_HEAD_SHA:0:8}"
+            PREFIX="pr/${REPO_NAME}/${PR_NUMBER}/${SHORT_SHA}/"
+          else
+            SHORT_SHA="${GITHUB_SHA:0:8}"
+            VERSION="${VERSION_INPUT:-$SHORT_SHA}"
+            PREFIX="main/${REPO_NAME}/${VERSION}/"
+          fi
+          echo "prefix=${PREFIX}" >> "$GITHUB_OUTPUT"
+          echo "Destination prefix: s3://\${AWS_FW_RC_BUCKET}/${PREFIX}"
+
+      - name: Download build artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: fw-artifact
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ vars.AWS_FW_BUILD_ROLE_ARN }}
+          role-session-name: GitHubActionsFwPublish
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Upload files to S3
+        env:
+          BUCKET: ${{ vars.AWS_FW_RC_BUCKET }}
+          PREFIX: ${{ steps.dest.outputs.prefix }}
+          FILES_JSON: ${{ inputs.files_json }}
+        run: |
+          set -euo pipefail
+          if [ -z "$BUCKET" ]; then
+            echo "vars.AWS_FW_RC_BUCKET is not set on the calling repo - nothing to upload to." >&2
+            exit 1
+          fi
+          if ! printf '%s' "$FILES_JSON" | jq -e 'type == "array" and length > 0 and all(.[]; type == "string")' >/dev/null 2>&1; then
+            echo "files_json must be a non-empty JSON array of strings, got: ${FILES_JSON}" >&2
+            exit 1
+          fi
+          mapfile -t PATTERNS <<< "$(printf '%s' "$FILES_JSON" | jq -r '.[]')"
+          UPLOADED=0
+          for pattern in "${PATTERNS[@]}"; do
+            pattern="${pattern%$'\r'}" # tolerate a stray CR (CRLF input) rather than a silent non-match
+            [ -z "$pattern" ] && continue
+            for f in fw-artifact/$pattern; do
+              [ -e "$f" ] || continue
+              dest="s3://${BUCKET}/${PREFIX}$(basename "$f")"
+              echo "Uploading $f -> $dest"
+              aws s3 cp "$f" "$dest"
+              UPLOADED=$((UPLOADED + 1))
+            done
+          done
+          if [ "$UPLOADED" -eq 0 ]; then
+            echo "No files matched any pattern in files_json under the downloaded artifact - failing closed." >&2
+            exit 1
+          fi
+          echo "Published ${UPLOADED} file(s) to s3://${BUCKET}/${PREFIX}" >> "$GITHUB_STEP_SUMMARY"
