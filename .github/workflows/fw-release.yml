@@ -1,0 +1,172 @@
+name: Reusable firmware release (S3)
+# =============================================================================
+# INF-82: creates a firmware release in the shared dis-firmware-releases S3 bucket
+# (shared-platform), one of two ways:
+#   source: candidate  - copies one object out of dis-firmware-release-candidates unchanged.
+#                         "Explicit promotion" of a build that already passed CI as a PR/main
+#                         candidate.
+#   source: build       - uploads a freshly built artifact (already produced earlier in the same
+#                         run, as an actions-artifact) straight to the releases bucket. For a
+#                         from-source release build (e.g. a release-tag pipeline) that was never
+#                         a candidate at all.
+#
+# Both run under the "release" GitHub Environment, whichever source - that Environment's
+# protection rules (reviewers, configured per-repo in GitHub) gate the run before the AWS OIDC
+# role-assumption step is even reached, and the dis-fw-release-gh-oidc-role trust policy also
+# requires the OIDC token's `environment` claim to say "release" (see that role's comments in
+# clc-infra-tg). vars.AWS_FW_RELEASE_ROLE_ARN, AWS_FW_RELEASES_BUCKET and (source=candidate only)
+# AWS_FW_RC_BUCKET must be configured as Environment variables on the "release" GitHub
+# Environment in the calling repo.
+# =============================================================================
+on:
+  workflow_call:
+    inputs:
+      source:
+        description: "candidate (copy an existing release-candidate object) or build (upload a freshly built artifact)"
+        required: true
+        type: string
+      source_key:
+        description: Release-candidate object key to promote. Required when source=candidate.
+        required: false
+        type: string
+        default: ''
+      artifact_name:
+        description: Name of the actions-artifact (uploaded earlier in this run) holding the built files. Required when source=build.
+        required: false
+        type: string
+        default: ''
+      files:
+        description: >-
+          Newline-separated list of file paths, relative to the downloaded artifact root, to
+          upload. Required when source=build.
+        required: false
+        type: string
+        default: ''
+      version:
+        description: Release version key, e.g. a tag-derived version. Required when source=build.
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  release:
+    name: "Release (${{ inputs.source }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release
+    concurrency:
+      group: ${{ github.repository }}-fw-release
+      cancel-in-progress: false
+    steps:
+      - name: Validate inputs
+        env:
+          SOURCE: ${{ inputs.source }}
+          SOURCE_KEY: ${{ inputs.source_key }}
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+          FILES: ${{ inputs.files }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          case "$SOURCE" in
+            candidate)
+              if [ -z "$SOURCE_KEY" ]; then
+                echo "source_key is required when source=candidate" >&2
+                exit 1
+              fi
+              ;;
+            build)
+              if [ -z "$ARTIFACT_NAME" ] || [ -z "$FILES" ] || [ -z "$VERSION" ]; then
+                echo "artifact_name, files and version are all required when source=build" >&2
+                exit 1
+              fi
+              ;;
+            *)
+              echo "source must be 'candidate' or 'build', got '${SOURCE}'" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Download build artifact
+        if: inputs.source == 'build'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: fw-release
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ vars.AWS_FW_RELEASE_ROLE_ARN }}
+          role-session-name: GitHubActionsFwRelease
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Promote a release-candidate
+        if: inputs.source == 'candidate'
+        id: promote
+        env:
+          RC_BUCKET: ${{ vars.AWS_FW_RC_BUCKET }}
+          RELEASES_BUCKET: ${{ vars.AWS_FW_RELEASES_BUCKET }}
+          SOURCE_KEY: ${{ inputs.source_key }}
+        run: |
+          set -euo pipefail
+          if [ -z "$RC_BUCKET" ] || [ -z "$RELEASES_BUCKET" ]; then
+            echo "vars.AWS_FW_RC_BUCKET and vars.AWS_FW_RELEASES_BUCKET must both be set on the 'release' Environment." >&2
+            exit 1
+          fi
+
+          # Candidate keys carry a main/ prefix (see fw-artifact-publish.yml); release keys don't.
+          TARGET_KEY="${SOURCE_KEY#main/}"
+
+          if ! aws s3api head-object --bucket "$RC_BUCKET" --key "$SOURCE_KEY" >/dev/null 2>&1; then
+            echo "ERROR: s3://${RC_BUCKET}/${SOURCE_KEY} does not exist" >&2
+            exit 1
+          fi
+
+          echo "Copying s3://${RC_BUCKET}/${SOURCE_KEY} -> s3://${RELEASES_BUCKET}/${TARGET_KEY}"
+          aws s3 cp "s3://${RC_BUCKET}/${SOURCE_KEY}" "s3://${RELEASES_BUCKET}/${TARGET_KEY}"
+
+          {
+            echo "Released (promoted candidate)"
+            echo ""
+            echo "- Source: \`s3://${RC_BUCKET}/${SOURCE_KEY}\`"
+            echo "- Target: \`s3://${RELEASES_BUCKET}/${TARGET_KEY}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload a fresh build
+        if: inputs.source == 'build'
+        env:
+          RELEASES_BUCKET: ${{ vars.AWS_FW_RELEASES_BUCKET }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          VERSION: ${{ inputs.version }}
+          FILES: ${{ inputs.files }}
+        run: |
+          set -euo pipefail
+          if [ -z "$RELEASES_BUCKET" ]; then
+            echo "vars.AWS_FW_RELEASES_BUCKET is not set on the 'release' Environment." >&2
+            exit 1
+          fi
+          PREFIX="${REPO_NAME}/${VERSION}/"
+          UPLOADED=0
+          while IFS= read -r pattern; do
+            [ -z "$pattern" ] && continue
+            for f in fw-release/$pattern; do
+              [ -e "$f" ] || continue
+              dest="s3://${RELEASES_BUCKET}/${PREFIX}$(basename "$f")"
+              echo "Uploading $f -> $dest"
+              aws s3 cp "$f" "$dest"
+              UPLOADED=$((UPLOADED + 1))
+            done
+          done <<< "$FILES"
+          if [ "$UPLOADED" -eq 0 ]; then
+            echo "No files matched the 'files' input under the downloaded artifact - failing closed." >&2
+            exit 1
+          fi
+          {
+            echo "Released (fresh build)"
+            echo ""
+            echo "- Target: \`s3://${RELEASES_BUCKET}/${PREFIX}\` (${UPLOADED} file(s))"
+          } >> "$GITHUB_STEP_SUMMARY"

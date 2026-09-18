@@ -1,10 +1,12 @@
 name: Reusable firmware artifact publish (S3)
 # =============================================================================
-# INF-82: uploads a firmware build's files to the shared dis-firmware-artifacts S3 bucket in
-# assetcore-dev, so devices can later download a targeted release via a presigned URL (see
-# clc-device-configurator) instead of through this repo's existing GitHub-Release publish path.
-# Additive: runs alongside that path without replacing it - see fw-promote.yml and
-# fw-cleanup-pr.yml for the rest of the flow.
+# INF-82: uploads a firmware build's files to the shared dis-firmware-release-candidates S3
+# bucket (shared-platform account - one bucket for every environment and every device repo; the
+# binaries are environment-agnostic, only their promotion state differs, see the companion
+# clc-infra-tg PR), so devices can later download a specific candidate for testing, or have it
+# promoted to a release, via clc-device-configurator's presigned URLs. Additive: runs alongside
+# this repo's existing GitHub-Release publish path - see fw-release.yml and fw-cleanup-pr.yml for
+# the rest of the flow.
 #
 # Called from a caller job that already built the firmware and uploaded it as a
 # `actions/upload-artifact` artifact earlier in the SAME workflow run - this job downloads that
@@ -12,7 +14,7 @@ name: Reusable firmware artifact publish (S3)
 # rebuilding.
 #
 # Key layout (shared by every repo that adopts this workflow, so the bucket's one lifecycle rule
-# and the fw-promote contract both keep working without further Terraform changes):
+# and the fw-release contract both keep working without further Terraform changes):
 #   pull_request event -> pr/<repo>/<pr_number>/<short_sha>/<filename>
 #   push / workflow_dispatch event -> main/<repo>/<version>/<filename>
 #
@@ -38,7 +40,8 @@ on:
         description: >-
           Version string to key a main-branch build under (e.g. the app's own fw version). Falls
           back to the short commit SHA when empty - always set this once the repo has a real
-          version identifier, so a promotable build has a stable, human-meaningful key.
+          version identifier, so a release-candidate has a stable, human-meaningful key (it also
+          becomes the release key, unchanged, if this candidate is later promoted).
         required: false
         type: string
         default: ''
@@ -49,7 +52,7 @@ permissions:
 
 jobs:
   publish:
-    name: Publish firmware artifact to S3 (dev)
+    name: Publish firmware artifact to S3 (release-candidates)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -72,7 +75,7 @@ jobs:
             PREFIX="main/${REPO_NAME}/${VERSION}/"
           fi
           echo "prefix=${PREFIX}" >> "$GITHUB_OUTPUT"
-          echo "Destination prefix: s3://\${AWS_FW_ARTIFACTS_BUCKET}/${PREFIX}"
+          echo "Destination prefix: s3://\${AWS_FW_RC_BUCKET}/${PREFIX}"
 
       - name: Download build artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -89,13 +92,13 @@ jobs:
 
       - name: Upload files to S3
         env:
-          BUCKET: ${{ vars.AWS_FW_ARTIFACTS_BUCKET }}
+          BUCKET: ${{ vars.AWS_FW_RC_BUCKET }}
           PREFIX: ${{ steps.dest.outputs.prefix }}
           FILES: ${{ inputs.files }}
         run: |
           set -euo pipefail
           if [ -z "$BUCKET" ]; then
-            echo "vars.AWS_FW_ARTIFACTS_BUCKET is not set on the calling repo - nothing to upload to." >&2
+            echo "vars.AWS_FW_RC_BUCKET is not set on the calling repo - nothing to upload to." >&2
             exit 1
           fi
           UPLOADED=0
