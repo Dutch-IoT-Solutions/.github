@@ -1,0 +1,47 @@
+name: Reusable firmware artifact PR cleanup (S3)
+# =============================================================================
+# INF-82: deletes a closed PR's firmware artifacts (pr/<repo>/<pr_number>/) from the shared
+# dis-firmware-artifacts S3 bucket in assetcore-dev. Call this on `pull_request: types: [closed]`
+# - regardless of whether the PR was merged: an abandoned PR's build has no promotion value
+# either way, and this is strictly narrower than the 14-day lifecycle-rule backstop on the bucket.
+#
+# Mark the calling job `continue-on-error: true` while running alongside the existing publish
+# path - a cleanup failure must never block anything. The lifecycle rule on the bucket is exactly
+# that backstop if this step is ever skipped.
+# =============================================================================
+on:
+  workflow_call: {}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  cleanup:
+    name: Delete PR firmware artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ vars.AWS_FW_BUILD_ROLE_ARN }}
+          role-session-name: GitHubActionsFwCleanupPr
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Delete PR artifacts
+        env:
+          BUCKET: ${{ vars.AWS_FW_ARTIFACTS_BUCKET }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [ -z "$BUCKET" ]; then
+            echo "vars.AWS_FW_ARTIFACTS_BUCKET is not set on the calling repo - nothing to clean up." >&2
+            exit 1
+          fi
+          PREFIX="pr/${REPO_NAME}/${PR_NUMBER}/"
+          echo "Deleting s3://${BUCKET}/${PREFIX}"
+          aws s3 rm "s3://${BUCKET}/${PREFIX}" --recursive
+          echo "Deleted s3://${BUCKET}/${PREFIX}" >> "$GITHUB_STEP_SUMMARY"

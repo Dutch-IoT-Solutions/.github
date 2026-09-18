@@ -1,0 +1,103 @@
+name: Reusable firmware artifact promote (S3)
+# =============================================================================
+# INF-82: copies one dev-validated firmware artifact forward, unchanged, between the shared
+# dis-firmware-artifacts S3 buckets:
+#   preprod  <- assetcore-dev's main/<repo>/<version>/<filename>
+#   prod     <- assetcore-preprod's <repo>/<version>/<filename>
+#
+# `target_environment` becomes this job's GitHub Environment, so the run must pass that
+# Environment's protection rules (e.g. required reviewers) before the AWS OIDC role-assumption
+# step below is even reached - the dis-fw-promote-gh-oidc-role trust policy also requires the
+# OIDC token's `environment` claim to match ("preprod" or "prod"), so an Environment without a
+# reviewer gate does not, on its own, let a run skip review and still assume the role: the role
+# still has to be given that Environment's exact name, which the repo controls the same way.
+#
+# vars.AWS_FW_PROMOTE_ROLE_ARN, AWS_FW_ARTIFACTS_BUCKET (the target bucket) and
+# AWS_FW_ARTIFACTS_BUCKET_SOURCE (the bucket to copy from) must be configured as Environment
+# variables on both the "preprod" and "prod" GitHub Environments in the calling repo - each
+# Environment holds different values (different account, different bucket, different role ARN).
+# =============================================================================
+on:
+  workflow_call:
+    inputs:
+      target_environment:
+        description: Environment to promote into (preprod or prod)
+        required: true
+        type: string
+      source_key:
+        description: >-
+          Object key to copy, as it exists in the SOURCE bucket for this target_environment (a
+          main/<repo>/<version>/<filename> key when promoting into preprod, a
+          <repo>/<version>/<filename> key when promoting into prod).
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  promote:
+    name: Promote to ${{ inputs.target_environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: ${{ inputs.target_environment }}
+    concurrency:
+      group: ${{ github.repository }}-fw-promote-${{ inputs.target_environment }}
+      cancel-in-progress: false
+    steps:
+      - name: Validate inputs
+        env:
+          TARGET_ENVIRONMENT: ${{ inputs.target_environment }}
+          SOURCE_KEY: ${{ inputs.source_key }}
+        run: |
+          set -euo pipefail
+          case "$TARGET_ENVIRONMENT" in
+            preprod|prod) ;;
+            *)
+              echo "target_environment must be 'preprod' or 'prod', got '${TARGET_ENVIRONMENT}'" >&2
+              exit 1
+              ;;
+          esac
+          if [ -z "$SOURCE_KEY" ]; then
+            echo "source_key is required" >&2
+            exit 1
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ vars.AWS_FW_PROMOTE_ROLE_ARN }}
+          role-session-name: GitHubActionsFwPromote${{ inputs.target_environment }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Copy artifact
+        env:
+          SOURCE_BUCKET: ${{ vars.AWS_FW_ARTIFACTS_BUCKET_SOURCE }}
+          TARGET_BUCKET: ${{ vars.AWS_FW_ARTIFACTS_BUCKET }}
+          SOURCE_KEY: ${{ inputs.source_key }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SOURCE_BUCKET" ] || [ -z "$TARGET_BUCKET" ]; then
+            echo "vars.AWS_FW_ARTIFACTS_BUCKET_SOURCE and vars.AWS_FW_ARTIFACTS_BUCKET must both be set on the '${{ inputs.target_environment }}' Environment." >&2
+            exit 1
+          fi
+
+          # Dev keys carry a main/ prefix (see fw-artifact-publish.yml); preprod/prod keys don't.
+          # Stripping it is a no-op on a preprod->prod promotion, where it was never there.
+          TARGET_KEY="${SOURCE_KEY#main/}"
+
+          if ! aws s3api head-object --bucket "$SOURCE_BUCKET" --key "$SOURCE_KEY" >/dev/null 2>&1; then
+            echo "ERROR: s3://${SOURCE_BUCKET}/${SOURCE_KEY} does not exist" >&2
+            exit 1
+          fi
+
+          echo "Copying s3://${SOURCE_BUCKET}/${SOURCE_KEY} -> s3://${TARGET_BUCKET}/${TARGET_KEY}"
+          aws s3 cp "s3://${SOURCE_BUCKET}/${SOURCE_KEY}" "s3://${TARGET_BUCKET}/${TARGET_KEY}"
+
+          {
+            echo "Promoted to ${{ inputs.target_environment }}"
+            echo ""
+            echo "- Source: \`s3://${SOURCE_BUCKET}/${SOURCE_KEY}\`"
+            echo "- Target: \`s3://${TARGET_BUCKET}/${TARGET_KEY}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
