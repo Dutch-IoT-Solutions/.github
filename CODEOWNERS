@@ -1,0 +1,11 @@
+# Who is required to review changes to this repo.
+#
+# A team handle only works if the team has WRITE access to this repo. With read
+# access GitHub skips the review request silently, with no error and no reviewer,
+# so check Settings > Collaborators and teams if reviewers stop being added.
+#
+# Rules are evaluated top to bottom and the LAST matching pattern wins, so put
+# specific paths below general ones.
+# Docs: https://docs.github.com/articles/about-code-owners
+
+*    @Dutch-IoT-Solutions/firmware
